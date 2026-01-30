@@ -1,3 +1,7 @@
+# =============================================
+# vCenter 8 conexión
+# =============================================
+
 $vc8 = "vc-l-01a.corp.internal"
 $user = "administrator@vsphere.local"
 $pass = "VMware1!"
@@ -6,7 +10,9 @@ $sec = ConvertTo-SecureString $pass -AsPlainText -Force
 $cred = New-Object System.Management.Automation.PSCredential ($user, $sec)
 
 Connect-VIServer -Server $vc8 -Credential $cred
+# =============================================
 # Exporta todos los roles que No son de sistema
+# =============================================
 
 $outFile = ".\roles-exportados-vc8.json"
 
