@@ -1,14 +1,13 @@
-﻿# =====================================================================
+ # =====================================================================
 # Secure Boot VMware KB Assessment - Segun VMware KB 423893 y 423919
 # =====================================================================
 
 param(
-    [string]$vCenter = "vc-01c.corp.internal",
-    [string]$CsvPath = ".\vms-archivo-ejemplo.csv",
+    [string]$vCenter = "vc-l-01a.corp.internal",
+    [string]$CsvPath = ".\vms.csv",
     [string]$OutputXlsx = ".\SecureBoot_Assessment.xlsx"
 )
 
-Import-Module VMware.PowerCLI
 Import-Module ImportExcel
 
 Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false | Out-Null
@@ -55,6 +54,8 @@ foreach ($row in $vmList) {
         DB2023       = ""
         Event1801    = ""
         Event1769    = ""
+        Event1799    = ""
+        Event1808    = ""
         Assessment   = ""
         Notes        = ""
     }
@@ -126,29 +127,29 @@ try {
     if ($txt2 -match "Windows UEFI CA 2023") { $dbResult = "Present" } else { $dbResult = "Missing" }
 } catch { $dbResult = "Error" }
 
-try {
-    $e1 = Get-WinEvent -FilterHashtable @{LogName='System';Id=1801} -MaxEvents 1 -ErrorAction SilentlyContinue
-    if ($e1) { $evt1801 = "Yes" } else { $evt1801 = "No" }
-} catch { $evt1801 = "No" }
+# Eventos
+function Get-Evt($id) {
+    try {
+        $e = Get-WinEvent -FilterHashtable @{LogName='System';Id=$id} -MaxEvents 1 -ErrorAction SilentlyContinue
+        if ($e) { "Yes" } else { "No" }
+    } catch { "No" }
+}
 
-try {
-    $e2 = Get-WinEvent -FilterHashtable @{LogName='System';Id=1769} -MaxEvents 1 -ErrorAction SilentlyContinue
-    if ($e2) { $evt1769 = "Yes" } else { $evt1769 = "No" }
-} catch { $evt1769 = "No" }
+$evt1801 = Get-Evt 1801
+$evt1769 = Get-Evt 1769
+$evt1799 = Get-Evt 1799
+$evt1808 = Get-Evt 1808
 
 Write-Output "PK=$pkResult"
 Write-Output "KEK=$kekResult"
 Write-Output "DB=$dbResult"
 Write-Output "EV1801=$evt1801"
 Write-Output "EV1769=$evt1769"
+Write-Output "EV1799=$evt1799"
+Write-Output "EV1808=$evt1808"
 '@
 
-        $r = Invoke-VMScript `
-            -VM $vm `
-            -GuestCredential $GuestCred `
-            -ScriptType PowerShell `
-            -ScriptText $script `
-            -ErrorAction Stop
+        $r = Invoke-VMScript -VM $vm -GuestCredential $GuestCred -ScriptType PowerShell -ScriptText $script -ErrorAction Stop
 
         $obj.GuestAccess = $true
         Show-Line "Guest Access" "OK" "Green"
@@ -159,17 +160,31 @@ Write-Output "EV1769=$evt1769"
             if ($line -match "^DB=")     { $obj.DB2023 = $line.Replace("DB=","").Trim() }
             if ($line -match "^EV1801=") { $obj.Event1801 = $line.Replace("EV1801=","").Trim() }
             if ($line -match "^EV1769=") { $obj.Event1769 = $line.Replace("EV1769=","").Trim() }
+            if ($line -match "^EV1799=") { $obj.Event1799 = $line.Replace("EV1799=","").Trim() }
+            if ($line -match "^EV1808=") { $obj.Event1808 = $line.Replace("EV1808=","").Trim() }
         }
 
         Show-Line "PK" $obj.PK $(if($obj.PK -eq "OK"){"Green"}else{"Red"})
         Show-Line "KEK 2023" $obj.KEK2023 $(if($obj.KEK2023 -eq "Present"){"Green"}else{"Red"})
         Show-Line "DB 2023" $obj.DB2023 $(if($obj.DB2023 -eq "Present"){"Green"}else{"Yellow"})
-        Show-Line "Event 1801" $obj.Event1801 $(if($obj.Event1801 -eq "No"){"Green"}else{"Yellow"})
-        Show-Line "Event 1769" $obj.Event1769 $(if($obj.Event1769 -eq "No"){"Green"}else{"Yellow"})
+        Show-Line "Event 1799" $obj.Event1799 $(if($obj.Event1799 -eq "Yes"){"Green"}else{"Gray"})
+        Show-Line "Event 1808" $obj.Event1808 $(if($obj.Event1808 -eq "Yes"){"Green"}else{"Gray"})
+        Show-Line "Event 1801" $obj.Event1801 $(if($obj.Event1801 -eq "No"){"Green"}else{"Red"})
+        Show-Line "Event 1769" $obj.Event1769 $(if($obj.Event1769 -eq "No"){"Green"}else{"Red"})
 
-        if ($obj.PK -eq "Invalid" -and $obj.KEK2023 -eq "Missing") {
+        # NUEVA PRIORIDAD
+        if ($obj.Event1808 -eq "Yes") {
+            $obj.Assessment = "Healthy"
+            $obj.Notes = "Fully updated (Event 1808)"
+            Show-Line "RESULT" "Healthy (1808)" "Green"
+        }
+        elseif ($obj.Event1799 -eq "Yes") {
+            $obj.Assessment = "Healthy"
+            $obj.Notes = "Bootloader updated (1799)"
+            Show-Line "RESULT" "Healthy (1799)" "Green"
+        }
+        elseif ($obj.PK -eq "Invalid" -and $obj.KEK2023 -eq "Missing") {
             $obj.Assessment = "Affected"
-            $obj.Notes = "Manual PK update required"
             Show-Line "RESULT" "Affected" "Red"
         }
         elseif ($obj.PK -eq "Invalid" -and $obj.KEK2023 -eq "Present") {
@@ -202,17 +217,10 @@ Write-Output "EV1769=$evt1769"
 
 Write-Progress -Activity "Secure Boot Assessment" -Completed
 
-$results | Export-Excel `
-    -Path $OutputXlsx `
-    -WorksheetName "Assessment" `
-    -AutoSize `
-    -AutoFilter `
-    -FreezeTopRow `
-    -BoldTopRow
+$results | Export-Excel -Path $OutputXlsx -WorksheetName "Assessment" -AutoSize -AutoFilter -FreezeTopRow -BoldTopRow
 
-Write-Host ""
-Write-Host "Reporte generado: $OutputXlsx" -ForegroundColor Green
+Write-Host "`nReporte generado: $OutputXlsx" -ForegroundColor Green
 
-$results | Format-Table VMName,PK,KEK2023,DB2023,Assessment -AutoSize
+$results | Format-Table VMName,PK,KEK2023,DB2023,Event1799,Event1808,Assessment -AutoSize
 
-Disconnect-VIServer -Server -Confirm:$false
+Disconnect-VIServer -Server $vCenter -Confirm:$false 
