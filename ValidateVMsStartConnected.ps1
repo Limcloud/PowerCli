@@ -1,42 +1,46 @@
-# Requires VMware PowerCLI
-# Install-Module VMware.PowerCLI -Scope CurrentUser
+ # Requires VMware PowerCLI
 
-$vCenter = "vcsa-p-01.vspotcr.com"
+$vCenter = "vc-01c.corp.internal"
 $username = "administrator@vsphere.local"
-$password = "VMware1!"
+$password = "VMware1!VMware1!"
 
-# Convertir password a SecureString
+$exportFolder = "C:\Temp"
+$exportPath   = "$exportFolder\VM-NetworkAdapters-ConnectAtPowerOn.csv"
+
+if (!(Test-Path $exportFolder)) {
+    New-Item -ItemType Directory -Path $exportFolder | Out-Null
+}
+
 $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
-
-# Crear credencial
 $credential = New-Object System.Management.Automation.PSCredential ($username, $securePassword)
 
-# Conectarse al vCenter
 Connect-VIServer -Server $vCenter -Credential $credential
 
-# Obtener información de VMs y NICs
-$results = Get-VM | ForEach-Object {
-    $vm = $_
+$results = @()
 
-    Get-NetworkAdapter -VM $vm | ForEach-Object {
-        [PSCustomObject]@{
+$vms = Get-VM
+
+foreach ($vm in $vms) {
+    $nics = Get-NetworkAdapter -VM $vm
+
+    foreach ($nic in $nics) {
+        $results += [PSCustomObject]@{
             VMName           = $vm.Name
             PowerState       = $vm.PowerState
-            NetworkAdapter   = $_.Name
-            NetworkName      = $_.NetworkName
-            MacAddress       = $_.MacAddress
-            Connected        = $_.ConnectionState.Connected
-            StartConnected   = $_.ConnectionState.StartConnected
-            ConnectAtPowerOn = if ($_.ConnectionState.StartConnected) { "Yes" } else { "No" }
+            NetworkAdapter   = $nic.Name
+            NetworkName      = $nic.NetworkName
+            MacAddress       = $nic.MacAddress
+            Connected        = $nic.ConnectionState.Connected
+            StartConnected   = $nic.ConnectionState.StartConnected
+            ConnectAtPowerOn = if ($nic.ConnectionState.StartConnected) { "Yes" } else { "No" }
         }
     }
 }
 
-# Mostrar resultados
 $results | Format-Table -AutoSize
 
-# Export opcional
-$results | Export-Csv -Path ".\VM-NetworkAdapters-ConnectAtPowerOn.csv" -NoTypeInformation -Encoding UTF8
+$results | Export-Csv -Path $exportPath -NoTypeInformation -Encoding UTF8 -Force
 
-# Desconectarse
-Disconnect-VIServer -Server $vCenter -Confirm:$false
+Write-Host "Reporte generado en: $exportPath" -ForegroundColor Green
+
+Disconnect-VIServer -Server $vCenter -Confirm:$false 
