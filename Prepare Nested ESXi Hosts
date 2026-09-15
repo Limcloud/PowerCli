@@ -1,0 +1,566 @@
+ #requires -Version 5.1
+
+###############################################################################
+# Nested ESXi Configuration
+#
+# Hosts:
+# 192.168.12.220  esx-vcf9-mgmt-01
+# 192.168.12.221  esx-vcf9-mgmt-02
+# 192.168.12.222  esx-vcf9-mgmt-03
+# 192.168.12.223  esx-vcf9-mgmt-04
+#
+# Tasks:
+# - Configure hostname
+# - Configure NTP: 192.168.12.253
+# - Enable/start NTP
+# - Enable SSH permanently
+# - Disable /Net/FollowHardwareMac
+# - Regenerate ESXi self-signed certificate
+# - Pause for manual vCloud Director NIC MAC reset
+# - Save ESXi configuration
+# - Reboot
+###############################################################################
+
+$ErrorActionPreference = "Stop"
+
+# ---------------------------------------------------------------------------
+# CONFIGURATION
+# ---------------------------------------------------------------------------
+
+$NtpServer = "192.168.13.253"
+
+$EsxiUser = "root"
+$EsxiPassword = "VMware1!VMware1!"
+
+$Hosts = @(
+    @{
+        IP       = "192.168.12.220"
+        Hostname = "esx-vcf9-mgmt-01"
+    },
+    @{
+        IP       = "192.168.12.221"
+        Hostname = "esx-vcf9-mgmt-02"
+    },
+    @{
+        IP       = "192.168.12.222"
+        Hostname = "esx-vcf9-mgmt-03"
+    }
+)
+
+# ---------------------------------------------------------------------------
+# CHECK REQUIRED MODULES
+# ---------------------------------------------------------------------------
+
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host " Checking required PowerShell modules" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+
+if (-not (Get-Module -ListAvailable -Name VMware.PowerCLI)) {
+
+    Write-Host "VMware.PowerCLI is not installed." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Install it with:"
+    Write-Host "Install-Module VMware.PowerCLI -Scope CurrentUser"
+    exit 1
+}
+
+if (-not (Get-Module -ListAvailable -Name Posh-SSH)) {
+
+    Write-Host "Posh-SSH is not installed." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Install it with:"
+    Write-Host "Install-Module Posh-SSH -Scope CurrentUser"
+    exit 1
+}
+
+Import-Module VMware.PowerCLI
+Import-Module Posh-SSH
+
+# Ignore self-signed certificate warnings
+Set-PowerCLIConfiguration `
+    -InvalidCertificateAction Ignore `
+    -Confirm:$false | Out-Null
+
+# Avoid CEIP prompt
+Set-PowerCLIConfiguration `
+    -ParticipateInCEIP:$false `
+    -Confirm:$false | Out-Null
+
+
+# ---------------------------------------------------------------------------
+# CREATE CREDENTIAL OBJECT
+# ---------------------------------------------------------------------------
+
+$SecurePassword = ConvertTo-SecureString $EsxiPassword -AsPlainText -Force
+
+$Credential = New-Object `
+    System.Management.Automation.PSCredential `
+    ($EsxiUser, $SecurePassword)
+
+
+# ---------------------------------------------------------------------------
+# PROCESS EACH ESXI HOST
+# ---------------------------------------------------------------------------
+
+foreach ($HostInfo in $Hosts) {
+
+    $IP = $HostInfo.IP
+    $ExpectedHostname = $HostInfo.Hostname
+
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host " Processing $ExpectedHostname" -ForegroundColor Cyan
+    Write-Host " IP: $IP" -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor Cyan
+
+    $VIServer = $null
+    $SSHSession = $null
+
+    try {
+
+        #######################################################################
+        # 1. CONNECT DIRECTLY TO ESXI WITH POWERCLI
+        #######################################################################
+
+        Write-Host ""
+        Write-Host "[1/8] Connecting to ESXi..." -ForegroundColor Yellow
+
+        $VIServer = Connect-VIServer `
+            -Server $IP `
+            -Credential $Credential `
+            -WarningAction SilentlyContinue
+
+        $VMHost = Get-VMHost -Server $VIServer
+
+        Write-Host "Connected to $($VMHost.Name)" -ForegroundColor Green
+
+
+        #######################################################################
+        # 2. CONFIGURE NTP
+        #######################################################################
+
+        Write-Host ""
+        Write-Host "[2/8] Configuring NTP..." -ForegroundColor Yellow
+
+        $ExistingNtpServers = @(
+            Get-VMHostNtpServer `
+                -VMHost $VMHost `
+                -ErrorAction SilentlyContinue
+        )
+
+        # Remove any old NTP servers
+        foreach ($ExistingNtp in $ExistingNtpServers) {
+
+            if ($ExistingNtp -ne $NtpServer) {
+
+                Write-Host "Removing old NTP server: $ExistingNtp"
+
+                Remove-VMHostNtpServer `
+                    -VMHost $VMHost `
+                    -NtpServer $ExistingNtp `
+                    -Confirm:$false
+            }
+        }
+
+        # Add desired NTP server if not already present
+        if ($ExistingNtpServers -notcontains $NtpServer) {
+
+            Add-VMHostNtpServer `
+                -VMHost $VMHost `
+                -NtpServer $NtpServer `
+                -Confirm:$false
+
+            Write-Host "NTP server added: $NtpServer" -ForegroundColor Green
+        }
+        else {
+            Write-Host "NTP server already configured." -ForegroundColor Green
+        }
+
+
+        #######################################################################
+        # 3. ENABLE NTP SERVICE PERMANENTLY
+        #######################################################################
+
+        Write-Host ""
+        Write-Host "[3/8] Enabling NTP service..." -ForegroundColor Yellow
+
+        $NtpService = Get-VMHostService `
+            -VMHost $VMHost |
+            Where-Object { $_.Key -eq "ntpd" }
+
+        if ($NtpService) {
+
+            Set-VMHostService `
+                -HostService $NtpService `
+                -Policy On `
+                -Confirm:$false | Out-Null
+
+            $NtpService = Get-VMHostService `
+                -VMHost $VMHost |
+                Where-Object { $_.Key -eq "ntpd" }
+
+            if (-not $NtpService.Running) {
+
+                Start-VMHostService `
+                    -HostService $NtpService `
+                    -Confirm:$false | Out-Null
+            }
+
+            Write-Host "NTP service enabled and configured to start with ESXi." `
+                -ForegroundColor Green
+        }
+        else {
+            Write-Warning "NTP service was not found."
+        }
+
+
+        #######################################################################
+        # 4. ENABLE SSH SERVICE PERMANENTLY
+        #######################################################################
+
+        Write-Host ""
+        Write-Host "[4/8] Enabling SSH permanently..." -ForegroundColor Yellow
+
+        $SSHService = Get-VMHostService `
+            -VMHost $VMHost |
+            Where-Object { $_.Key -eq "TSM-SSH" }
+
+        if (-not $SSHService) {
+            throw "TSM-SSH service was not found."
+        }
+
+        Set-VMHostService `
+            -HostService $SSHService `
+            -Policy On `
+            -Confirm:$false | Out-Null
+
+        $SSHService = Get-VMHostService `
+            -VMHost $VMHost |
+            Where-Object { $_.Key -eq "TSM-SSH" }
+
+        if (-not $SSHService.Running) {
+
+            Start-VMHostService `
+                -HostService $SSHService `
+                -Confirm:$false | Out-Null
+        }
+
+        Write-Host "SSH enabled." -ForegroundColor Green
+        Write-Host "SSH startup policy: ON / Start and stop with host." `
+            -ForegroundColor Green
+
+
+        #######################################################################
+        # 5. OPEN SSH SESSION
+        #######################################################################
+
+        Write-Host ""
+        Write-Host "[5/8] Opening SSH session..." -ForegroundColor Yellow
+
+        Start-Sleep -Seconds 2
+
+        $SSHSession = New-SSHSession `
+            -ComputerName $IP `
+            -Credential $Credential `
+            -AcceptKey `
+            -ConnectionTimeout 20
+
+        if (-not $SSHSession) {
+            throw "Could not establish SSH connection."
+        }
+
+
+        #######################################################################
+        # 6. CONFIGURE HOSTNAME / FOLLOW HARDWARE MAC / CERTIFICATE
+        #######################################################################
+
+        Write-Host ""
+        Write-Host "[6/8] Configuring ESXi settings..." -ForegroundColor Yellow
+
+
+        # --------------------------------------------------------------------
+        # Hostname
+        # --------------------------------------------------------------------
+
+        Write-Host ""
+        Write-Host "Setting hostname to: $ExpectedHostname"
+
+        $Command = "esxcli system hostname set --host='$ExpectedHostname'"
+
+        $Result = Invoke-SSHCommand `
+            -SSHSession $SSHSession `
+            -Command $Command
+
+        if ($Result.ExitStatus -ne 0) {
+            Write-Warning "Hostname command returned an error:"
+            $Result.Error | ForEach-Object { Write-Host $_ }
+        }
+
+
+        # --------------------------------------------------------------------
+        # FollowHardwareMac
+        # --------------------------------------------------------------------
+
+        Write-Host ""
+        Write-Host "Disabling /Net/FollowHardwareMac..."
+
+        $Result = Invoke-SSHCommand `
+            -SSHSession $SSHSession `
+            -Command "esxcfg-advcfg -s 0 /Net/FollowHardwareMac"
+
+        $Result.Output | ForEach-Object {
+            Write-Host $_
+        }
+
+
+        # Verify value
+        $Result = Invoke-SSHCommand `
+            -SSHSession $SSHSession `
+            -Command "esxcfg-advcfg -g /Net/FollowHardwareMac"
+
+        Write-Host "Current FollowHardwareMac setting:"
+
+        $Result.Output | ForEach-Object {
+            Write-Host $_ -ForegroundColor Green
+        }
+
+
+        # --------------------------------------------------------------------
+        # Certificate Backup
+        # --------------------------------------------------------------------
+
+        Write-Host ""
+        Write-Host "Backing up current certificate..."
+
+        $BackupCommand = @"
+cp /etc/vmware/ssl/rui.crt /etc/vmware/ssl/rui.crt.before-hostname-change 2>/dev/null
+cp /etc/vmware/ssl/rui.key /etc/vmware/ssl/rui.key.before-hostname-change 2>/dev/null
+"@
+
+        Invoke-SSHCommand `
+            -SSHSession $SSHSession `
+            -Command $BackupCommand | Out-Null
+
+
+        # --------------------------------------------------------------------
+        # Regenerate Certificate
+        # --------------------------------------------------------------------
+
+        Write-Host ""
+        Write-Host "Regenerating ESXi certificate..."
+
+        $Result = Invoke-SSHCommand `
+            -SSHSession $SSHSession `
+            -Command "/sbin/generate-certificates"
+
+        if ($Result.ExitStatus -ne 0) {
+
+            Write-Host ""
+            Write-Host "Certificate regeneration FAILED." `
+                -ForegroundColor Red
+
+            $Result.Error | ForEach-Object {
+                Write-Host $_ -ForegroundColor Red
+            }
+
+            throw "Certificate regeneration failed."
+        }
+
+        Write-Host "Certificate regenerated successfully." `
+            -ForegroundColor Green
+
+
+        # --------------------------------------------------------------------
+        # Show certificate subject
+        # --------------------------------------------------------------------
+
+        $Result = Invoke-SSHCommand `
+            -SSHSession $SSHSession `
+            -Command "openssl x509 -in /etc/vmware/ssl/rui.crt -noout -subject"
+
+        Write-Host ""
+        Write-Host "New certificate subject:" -ForegroundColor Green
+
+        $Result.Output | ForEach-Object {
+            Write-Host $_ -ForegroundColor Green
+        }
+
+
+        #######################################################################
+        # 7. MANUAL VCLOUD DIRECTOR STEP
+        #######################################################################
+
+        Write-Host ""
+        Write-Host "============================================================" `
+            -ForegroundColor Magenta
+
+        Write-Host " MANUAL ACTION REQUIRED" `
+            -ForegroundColor Magenta
+
+        Write-Host "============================================================" `
+            -ForegroundColor Magenta
+
+        Write-Host ""
+        Write-Host "Host: $ExpectedHostname"
+        Write-Host "IP:   $IP"
+        Write-Host ""
+        Write-Host "In vCloud Director:"
+        Write-Host ""
+        Write-Host "  1. Open the vApp"
+        Write-Host "  2. Select: $ExpectedHostname"
+        Write-Host "  3. From the left pane select NICs"
+        Write-Host "  4. Click EDIT"
+        Write-Host "  5. Reset MAC address for the FIRST NIC"
+        Write-Host "  6. Click Save"
+        Write-Host ""
+        Write-Host "DO NOT continue until the MAC has been reset." `
+            -ForegroundColor Yellow
+
+        Write-Host ""
+
+        Read-Host "Press ENTER after resetting the MAC address"
+
+
+        #######################################################################
+        # 8. SAVE CONFIGURATION
+        #######################################################################
+
+        Write-Host ""
+        Write-Host "[7/8] Saving ESXi configuration..." `
+            -ForegroundColor Yellow
+
+        $Result = Invoke-SSHCommand `
+            -SSHSession $SSHSession `
+            -Command "/bin/auto-backup.sh"
+
+        $Result.Output | ForEach-Object {
+            Write-Host $_
+        }
+
+
+        #######################################################################
+        # SHOW FINAL CONFIGURATION
+        #######################################################################
+
+        Write-Host ""
+        Write-Host "------------------------------------------------------------"
+        Write-Host "Final configuration for $ExpectedHostname"
+        Write-Host "------------------------------------------------------------"
+
+        Write-Host "NTP:"
+        Get-VMHostNtpServer -VMHost $VMHost |
+            ForEach-Object {
+                Write-Host "  $_" -ForegroundColor Green
+            }
+
+        $NtpStatus = Get-VMHostService `
+            -VMHost $VMHost |
+            Where-Object {
+                $_.Key -eq "ntpd"
+            }
+
+        Write-Host "NTP Running: $($NtpStatus.Running)"
+        Write-Host "NTP Policy:  $($NtpStatus.Policy)"
+
+        $SSHStatus = Get-VMHostService `
+            -VMHost $VMHost |
+            Where-Object {
+                $_.Key -eq "TSM-SSH"
+            }
+
+        Write-Host "SSH Running: $($SSHStatus.Running)"
+        Write-Host "SSH Policy:  $($SSHStatus.Policy)"
+
+
+        #######################################################################
+        # REBOOT
+        #######################################################################
+
+        Write-Host ""
+        Write-Host "[8/8] Rebooting $ExpectedHostname..." `
+            -ForegroundColor Yellow
+
+        # Use nohup to allow SSH session to close cleanly
+        Invoke-SSHCommand `
+            -SSHSession $SSHSession `
+            -Command "nohup reboot >/dev/null 2>&1 &" `
+            -TimeOut 5 `
+            -ErrorAction SilentlyContinue | Out-Null
+
+        Write-Host ""
+        Write-Host "Reboot initiated successfully." `
+            -ForegroundColor Green
+
+
+        #######################################################################
+        # CLEAN UP CONNECTIONS
+        #######################################################################
+
+        if ($SSHSession) {
+
+            Remove-SSHSession `
+                -SSHSession $SSHSession |
+                Out-Null
+        }
+
+        Disconnect-VIServer `
+            -Server $VIServer `
+            -Confirm:$false
+
+
+        Write-Host ""
+        Write-Host "Completed: $ExpectedHostname" `
+            -ForegroundColor Green
+
+    }
+    catch {
+
+        Write-Host ""
+        Write-Host "============================================================" `
+            -ForegroundColor Red
+
+        Write-Host "ERROR processing $ExpectedHostname ($IP)" `
+            -ForegroundColor Red
+
+        Write-Host $_.Exception.Message `
+            -ForegroundColor Red
+
+        Write-Host "============================================================" `
+            -ForegroundColor Red
+
+        if ($SSHSession) {
+
+            Remove-SSHSession `
+                -SSHSession $SSHSession `
+                -ErrorAction SilentlyContinue |
+                Out-Null
+        }
+
+        if ($VIServer) {
+
+            Disconnect-VIServer `
+                -Server $VIServer `
+                -Confirm:$false `
+                -ErrorAction SilentlyContinue
+        }
+
+        Write-Host ""
+        Write-Host "This host was NOT automatically rebooted." `
+            -ForegroundColor Yellow
+
+        Write-Host ""
+
+        Read-Host "Press ENTER to continue with the next ESXi"
+    }
+}
+
+Write-Host ""
+Write-Host "============================================================" `
+    -ForegroundColor Cyan
+
+Write-Host " All ESXi hosts have been processed" `
+    -ForegroundColor Cyan
+
+Write-Host "============================================================" `
+    -ForegroundColor Cyan 
